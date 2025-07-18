@@ -1,0 +1,893 @@
+---
+title: "Seabirds-Migration-Proteomics"
+author: "Alix de Jersey and Jack Rivers-Auty"
+date: "`r Sys.Date()`"
+output:
+    html_document:
+      toc: true
+      toc_title: "Table of Contents"
+      number_sections: true
+---
+
+```{r CSS install, include=T, results='asis', comment=NA, echo=F}
+x <- tryCatch(readLines("https://raw.githubusercontent.com/JackAuty/RmarkdownStyle/main/styles.css"), error=function(e) ""); if (length(x)) cat("<style>\n", paste(x, collapse="\n"), "\n</style>")
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,       # Show code
+  warning = FALSE,   # Suppress warnings
+  message = FALSE    # Suppress messages
+)
+
+options(scipen =999 )
+```
+
+# Load Required Packages
+
+```{r load-packages, warning=FALSE, message=FALSE, results='hide' }
+# Load packages, install if required
+packages <- c(
+  "ggplot2", "reshape2", "enrichR", "stringr", "rgl", "htmltools", "pkgconfig",
+  "PupillometryR", "viridis", "pheatmap", "MASS", "sjPlot", "emmeans", "remotes",
+  "ggfortify", "RColorBrewer", "readr", "caret", "dplyr", "ggvenn",
+  "ggVennDiagram", "pROC", "kableExtra", "tidyr", "DT")
+
+invisible(lapply(packages, function(pkg) {
+  if (!requireNamespace(pkg, quietly = TRUE)) install.packages(pkg)
+  library(pkg, character.only = TRUE)
+}))
+```
+# Citations
+```{r citations}
+
+# Use the existing package list
+pkg <- packages 
+
+# Create a character vector for clean citations
+citation_list <- character()  
+
+# Loop through each package and clean citation
+for (i in pkg) {
+  # Get the plain text citation
+  raw <- paste(capture.output(print(citation(i), style = "text", bibtex = FALSE)), collapse = "\n")
+  
+  # Clean: remove _, *, " and trailing . or ,.
+  clean <- gsub("_", "", raw, fixed = TRUE)
+  clean <- gsub("\\*", "", clean)
+  clean <- gsub('\\"', "", clean)            # Handles escaped quotes
+  clean <- gsub('"', "", clean)              # Handles regular quotes
+  clean <- gsub("\\\\texttt\\{(.*?)\\}", "\\1", clean)
+  clean <- gsub(", \\.$", "", clean)
+  clean <- gsub("\\s*\\.$", "", clean)
+  clean <- gsub("[\u201C\u201D]", "", clean)
+  clean <- trimws(clean)
+
+  # Append to citation list
+  citation_list <- c(citation_list, clean)
+}
+
+# Display as a table
+datatable(
+  data.frame(References = citation_list)
+)
+```
+
+Requires two files to run: 
+
+  1. Data file (Available through ProteomeXchange PXD064350)
+  2. Sample information
+
+```{r import data}
+# Load in proteomic data
+chicks_adults_df<- read_csv("github_data.csv")
+# Load in sample information
+chicks_adults_sampleinfo <- read_csv("github_chicks_adults_sampleinfo.csv")
+```
+
+```{r load age }
+# Extract the 'Age' column from the sample information dataframe and assign it to a new variable 'age'
+age <- chicks_adults_sampleinfo$Age
+```
+
+```{r clean proteins}
+# Remove rows with missing or blank gene symbols
+chicks_adults_df <- chicks_adults_df %>%
+  filter(!is.na(gene_symbol), gene_symbol != "")
+```
+
+# Figure 1a. PCA Plot. 
+```{r PCA}
+col<-rep("#22a884", length(age)) # Assign a colour to all data points
+col[age=="A"]<-"#355f8d" # Assign a different colour to one of the two groups. 
+
+sum(!complete.cases(chicks_adults_df[, 5:47])) # Determine the number of proteins detected in all individuals.
+
+# Transpose a complete (no NAs) matrix of the data columns for the PCA
+PCA_matrix <- t(as.matrix(chicks_adults_df[complete.cases(chicks_adults_df[, 5:47]), 5:47])) 
+
+PCA<-prcomp((PCA_matrix), scale=T) # Perform PCA on PCA_matrix with scaling = T (TRUE)
+summary_PCA<-round(data.frame(summary(PCA)$importance),3) # Summarise each component
+summary_PCA$PC1[2] # Extract the percentage variance explained by the second principal component (PC2)
+#pdf("PCA Proteomics Biomarker FFSH Adults vs Plastic load.pdf", height = 7, width =8) # Set up a PDF file
+par(fig=c(0, 1, 0, 1), oma=c(5, 2, 2, 2), mar=c(6, 4, 2, 2)) # Plot parameters and margins
+plot(PCA$x[,1:2], col=col,pch=16, cex=1.5,xlab="",ylab="") # Create a scatterplot of the first two principal components
+title(main="PCA Proteomics Biomarker FFSH Adults vs Low plastic chicks", # Add a title to the plot
+      xlab=paste0("PCA1 ",(100*summary_PCA$PC1[2]),"%"), # Add axis titles to the plot
+      ylab=paste0("PCA2 ",(100*summary_PCA$PC2[2]),"%"))
+      legend("topleft", # Add a legend to the top left corner
+              bty = "n", 
+              legend = c("Fledglings", "Adults"), 
+              pch = 16, 
+              col = c(levels(as.factor(col))), 
+              cex = 1, horiz=F, 
+      title="Age")
+```
+
+# Statistics 
+
+Calculate number of data points missing
+```{r calculate missing data}
+# Add empty columns to store the number of missing values for chicks and adults
+chicks_adults_df$NumberMissingChicks <- NA
+chicks_adults_df$NumberMissingAdults <- NA
+
+for(i in 1:nrow(chicks_adults_df)){
+  
+  # Extract the data for the current row
+  dat <- chicks_adults_df[i, 5:47]
+  
+  # Subset the data based on the group (Age: chicks, adults)
+  chick <- dat[age == "F"]
+  adult <- dat[age== "A"]
+  
+  # Calculate the number of missing values for each group
+  chicks_adults_df$NumberMissingChicks[i] <- sum(is.na(chick))
+  chicks_adults_df$NumberMissingAdults[i] <- sum(is.na(adult))
+}
+
+```
+
+T test using the lm function with age as the explanatory variable with boxcox applied
+```{r perform statistical analysis}
+# Add empty columns to store the results of the statistical tests
+chicks_adults_df$ttest <- NA
+chicks_adults_df$LogFold <- NA
+
+# Loop over each row of the dataframe
+for(i in 1:nrow(chicks_adults_df)){
+  print(i)  # Print the current row index for tracking progress
+  dat <- as.numeric(chicks_adults_df[i, 5:47])  # Extract the data for each row
+  
+  # Assign data points to the respective groups
+  chick <- dat[age == "F"]
+  adult <- dat[age == "A"]
+  
+  # Calculate the number of non-missing data points for each group
+  non_missing_chick <- sum(!is.na(chick))
+  non_missing_adult <- sum(!is.na(adult))
+  
+  # Check if there are enough data points to perform the analysis
+  if(non_missing_chick >= 14 & non_missing_adult >= 13) {
+    
+    # Fit the general linear model with age as the explanatory variable
+    lm1 <- lm(dat ~ age)
+    
+    # Box-Cox transformation to normalize the data
+    boxcox_result <- MASS::boxcox(lm1, lambda = seq(-5, 5, 0.003), plotit = FALSE)
+    
+    # Select the lambda that maximizes the Box-Cox log-likelihood
+    Selected.lambda <- boxcox_result$x[which.max(boxcox_result$y)]
+    
+    # Apply the Box-Cox transformation to the data
+    transDat <- dat^Selected.lambda
+    
+    # Perform the t-test on the transformed data
+    t_test_result <- t.test(transDat ~ age)
+    
+    # Store the p value from the t-test in the new column for the current row
+    chicks_adults_df$ttest[i] <- t_test_result$p.value
+    
+    # Calculate the log fold change between chick and adult age groups
+    chicks_adults_df$LogFold[i] <- log(mean(adult, na.rm = TRUE) / mean(chick, na.rm = TRUE), base = 2)
+    
+  } else {
+    # If not enough data points, assign NA to the t-test result and LogFold
+    chicks_adults_df$ttest[i] <- NA
+    chicks_adults_df$LogFold[i] <- NA
+    print(i)
+    print("Too few data points to perform stats")
+  }
+}
+
+# Adjust for multiple comparisons
+chicks_adults_df$p_adjust <- p.adjust(chicks_adults_df$ttest, method = "fdr")
+
+# Calculate the proportion of missing data
+chicks_adults_df$ProportionMissingChicks <- chicks_adults_df$NumberMissingChicks/19
+chicks_adults_df$ProportationMissingAdults <- chicks_adults_df$NumberMissingAdults/24
+```
+
+```{r view statistical results}
+# Sum the number of signficant protein pre and post adjustment
+sum(chicks_adults_df$ttest<0.05, na.rm = TRUE)
+sum(chicks_adults_df$p_adjust<0.01, na.rm = TRUE)
+```
+
+# Figure 1b. Volcano Plot. 
+```{r volcano plot}
+# Create a new column 'Sig' indicating whether the adjusted p-value is less than 0.05. 
+chicks_adults_df$Sig <- ifelse(is.na(chicks_adults_df$p_adjust), FALSE, chicks_adults_df$p_adjust < 0.05)
+
+# Create columns 'Up' and 'Down' indicating increased or decreased abundance of proteins based on Logfold and Sig
+chicks_adults_df$Up <- chicks_adults_df$Sig & chicks_adults_df$LogFold > 0
+chicks_adults_df$Down <- chicks_adults_df$Sig & chicks_adults_df$LogFold < 0
+
+# Default grey for all points
+chicks_adults_df$colour <- "#999999"
+
+# Colour significant upregulated proteins (positive LogFold)
+chicks_adults_df$colour[chicks_adults_df$Up] <- "#355f8d"
+
+# Colour significant downregulated proteins (negative LogFold)
+chicks_adults_df$colour[chicks_adults_df$Down] <- "#22a884"
+
+# Create a new column 'order' with a default value of 0.95 for all proteins.
+chicks_adults_df$order <- 0.95
+
+# Adjust point size: larger for significant, smaller for not
+chicks_adults_df$order <- ifelse(chicks_adults_df$Sig, 1.4, 0.95)
+
+# Order the dataframe for plotting
+df_graph_ordered <- chicks_adults_df[order(chicks_adults_df$order, decreasing = FALSE), ]
+
+# Set plot limits
+xmin <- -4
+xmax <- 4
+ymin <- 0.001
+ymax <- 20
+
+# Generate a volcano plot 
+plot.new()
+par(mfrow = c(1,1))
+
+plot(df_graph_ordered$LogFold, 
+     -log10(df_graph_ordered$p_adjust), 
+     col = adjustcolor(df_graph_ordered$colour, alpha.f = 0.8), 
+     pch = 16,
+     cex = df_graph_ordered$order,
+     xlab = "",
+     ylab = "",
+     xlim = c(xmin, xmax),
+     ylim = c(ymin, ymax),
+     axes = FALSE)
+
+# Add axes
+axis(1)
+axis(2)
+
+# Add labels
+title(xlab = "Fold change (log2)", ylab = "Adjusted p-value (log10)", mgp = c(2,2,0))
+
+# Add horizontal line for significance threshold (p = 0.05)
+abline(h = -log10(0.05), lty = 3)
+
+```
+
+# Enrichment analysis
+```{r subset control group}
+# Isolate the datacols
+ffsh2024_datacolumn <- 5:47
+
+# Create a new data frame containing the adults which represent our control for the enrichment analysis.
+enrichment_control_data<-chicks_adults_df[,-ffsh2024_datacolumn[age=="A"]]
+```
+
+```{r control enrichment}
+# Extract the 'gene_symbol' column from the control enrichment results and store it as 'control_genes'
+control_genes<-enrichment_control_data$gene_symbol
+
+# Create a subset of the databases of interest
+databases_of_interest<-c(
+  "GO_Molecular_Function_2025", 
+  "GO_Cellular_Component_2025", 
+  "GO_Biological_Process_2025",
+  "KEGG_2021_Human", 
+  "WikiPathway_2021_Human")
+
+# Perform enrichment using enrichr on the control genes  
+enrichment_control<-enrichr(as.character(control_genes), databases = databases_of_interest)
+```
+
+```{r significant enrichment}
+# Subset the gene symbols of the significant genes (where the p_adjust is less than 0.05) from the trimmed dataframe.
+genes_of_significance <- chicks_adults_df$gene_symbol[chicks_adults_df$p_adjust < 0.05 
+                                                              & !is.na(chicks_adults_df$p_adjust)]
+# Create a subset of the databases of interest
+databases_of_interest<-c("GO_Molecular_Function_2025",
+                         "GO_Cellular_Component_2025", 
+                         "GO_Biological_Process_2025",
+                         "KEGG_2021_Human", 
+                         "WikiPathway_2021_Human", 
+                         "TRRUST_Transcription_Factors_2019")
+
+#Selecting our genes and uploading them to 6 different enrichment databases  
+enrichment_Sig<-enrichr(as.character(genes_of_significance), databases = databases_of_interest)
+```
+
+1.GO_Molecular_function_2025 database 
+```{r G0_MF enrichment}
+# Building the significant and control protein data frames for the GO_Molecular_Function database
+go_mol_function_Sig <- enrichment_Sig$GO_Molecular_Function_2025[, c("Term", "Overlap", "Genes")]
+go_mol_function_Control <- enrichment_control$GO_Molecular_Function_2025[, c("Term", "Overlap", "Genes")]
+
+# Building empty columns for the loop
+go_mol_function_Sig$PermutationTest <- 999
+go_mol_function_Sig$ProteinNumber <- 999
+go_mol_function_Sig$ProteinNumberControl <- 999
+go_mol_function_Sig$TotalControlProtein <- nrow(enrichment_control_data)
+go_mol_function_Sig$TotalSignificant <- sum(chicks_adults_df$p_adjust < 0.05 & !is.na(chicks_adults_df$p_adjust))
+
+# Loop through each row of the significant data frame 
+for (i in 1:nrow(go_mol_function_Sig)) {
+  
+  # Extract and process data from the "Overlap" column
+  go_mol_function_Sig$ProteinNumber[i] <- as.numeric(sub("\\/.*", "", go_mol_function_Sig$Overlap[i])) 
+  
+  # Check if the term is present in the control data frame 
+  if (go_mol_function_Sig$Term[i] %in% go_mol_function_Control$Term) {
+    
+    Control_data <- go_mol_function_Control[go_mol_function_Control$Term == go_mol_function_Sig$Term[i], ] 
+    
+    # Extract relevant information from the control data frame
+    go_mol_function_Sig$ProteinNumberControl[i] <- as.numeric(sub("\\/.*", "", Control_data$Overlap)) 
+    
+  } else {
+    
+    # If the term is not present in the control data, set ProteinNumberControl to 0 
+    go_mol_function_Sig$ProteinNumberControl[i] <- 0 
+    
+  }
+}
+
+# Trimming out the very low count pathways. There's no point saying a pathway is enriched with 2 genes
+go_mol_function_Sig <- go_mol_function_Sig[go_mol_function_Sig$ProteinNumber > 2, ]
+
+# Generate p-values by performing a permutation test
+for (i in 1:nrow(go_mol_function_Sig)) {
+  
+  # Create a control vector for permutation test
+  control <- c(
+    rep(1, go_mol_function_Sig$ProteinNumberControl[i]), 
+    rep(0, go_mol_function_Sig$TotalControlProtein[i] - go_mol_function_Sig$ProteinNumberControl[i])
+  ) 
+  
+  # Perform a permutation test with 10,000 repeats
+  repeats <- 10000 
+  n <- rep(9999, repeats)
+  
+  for (j in 1:repeats) {
+    n[j] <- sum(sample(control, go_mol_function_Sig$TotalSignificant[i]))  
+  }
+  
+  # Calculate the p.value based on the permutation test
+  significant <- go_mol_function_Sig$ProteinNumber[i] 
+  go_mol_function_Sig$PermutationTest[i] <- sum(n >= significant) / repeats
+  
+  # Create a data frame for pathway and non-pathway counts 
+  dat <- data.frame(
+    "Control" = c(go_mol_function_Sig$ProteinNumberControl[i], 
+                  (go_mol_function_Sig$TotalControlProtein[i] -       go_mol_function_Sig$ProteinNumberControl[i])),
+    "Significant" = c(significant, 
+                      (go_mol_function_Sig$TotalSignificant[i] - significant)),
+    row.names = c("Pathway", "Non-pathway"),
+    stringsAsFactors = FALSE
+  ) 
+  
+  colnames(dat) <- c("Control", "Significant")
+}
+
+# Filter for significant pathways based on PermutationTest < 0.05 and view them
+adult_go_mol_function_Sig <- go_mol_function_Sig[go_mol_function_Sig$PermutationTest < 0.05, ]
+datatable(adult_go_mol_function_Sig)
+```
+
+2. GO_Cellular_Component_2025 database
+```{r GO_CC enrichment}
+
+GO_Cellular_Component_Sig<-enrichment_Sig$GO_Cellular_Component_2025[,c("Term","Overlap","Genes")]
+GO_Cellular_Component_Control<-enrichment_control$GO_Cellular_Component_2025[,c("Term","Overlap","Genes")]
+
+GO_Cellular_Component_Sig$PermutationTest<-999
+GO_Cellular_Component_Sig$ProteinNumber<-999
+GO_Cellular_Component_Sig$ProteinNumberControl<-999
+GO_Cellular_Component_Sig$TotalControlProtein<-nrow(enrichment_control_data)
+GO_Cellular_Component_Sig$TotalSignificant<-sum(chicks_adults_df$p_adjust < 0.05 &
+                                                  !is.na(chicks_adults_df$p_adjust))
+
+for(i in 1:nrow(GO_Cellular_Component_Sig)) {
+
+  GO_Cellular_Component_Sig$ProteinNumber[i]<-as.numeric(sub("\\/.*", "", GO_Cellular_Component_Sig$Overlap[i]))
+  
+  if(GO_Cellular_Component_Sig$Term[i] %in% GO_Cellular_Component_Control$Term){
+  Control_data<-GO_Cellular_Component_Control[GO_Cellular_Component_Control$Term==GO_Cellular_Component_Sig$Term[i],]
+  
+  GO_Cellular_Component_Sig$ProteinNumberControl[i]<-as.numeric(sub("\\/.*", "", Control_data$Overlap))
+  
+  } else {
+    GO_Cellular_Component_Sig$ProteinNumberControl[i]<-0
+  }
+}
+
+GO_Cellular_Component_Sig<- GO_Cellular_Component_Sig[GO_Cellular_Component_Sig$ProteinNumber>2,]
+
+for(i in 1:nrow(GO_Cellular_Component_Sig)){
+
+  control<-c(rep(1,GO_Cellular_Component_Sig$ProteinNumberControl[i]), rep(0,GO_Cellular_Component_Sig$TotalControlProtein[i] - 
+                                                                             GO_Cellular_Component_Sig$ProteinNumberControl[i]))
+
+  repeats<-10000
+
+  n<-rep(9999, repeats)
+  sum(control)
+
+for (j in 1:repeats){
+  
+  n[j]<-sum(sample(control, GO_Cellular_Component_Sig$TotalSignificant[i]))
+  
+}
+
+  significant<-GO_Cellular_Component_Sig$ProteinNumber[i]
+
+  GO_Cellular_Component_Sig$PermutationTest[i]<- sum(n>=(significant))/repeats
+
+  dat <- data.frame(
+    "Control" = c(GO_Cellular_Component_Sig$ProteinNumberControl[i], (GO_Cellular_Component_Sig$TotalControlProtein[i] -
+                                                                      GO_Cellular_Component_Sig$ProteinNumberControl[i])),
+    "Significant" = c(significant, (GO_Cellular_Component_Sig$TotalSignificant[i]-significant)),
+    row.names = c("Pathway", "Non-pathway"), stringsAsFactors = FALSE
+)
+  colnames(dat) <- c("Control", "Significant")
+
+  dat
+}
+
+
+adult_GO_Cellular_Component_Sig <- GO_Cellular_Component_Sig[GO_Cellular_Component_Sig$PermutationTest< 0.05, ]
+datatable(adult_GO_Cellular_Component_Sig)
+```
+
+3. GO_Biological_Process_2025 database
+```{r GO_BP enrichment}
+GO_Bioloigcal_Process_Sig<-enrichment_Sig$GO_Biological_Process_2025[,c("Term","Overlap","Genes")]
+GO_Bioloigcal_Process_Control<-enrichment_control$GO_Biological_Process_2025[,c("Term","Overlap","Genes")]
+
+GO_Bioloigcal_Process_Sig$PermutationTest<-999
+GO_Bioloigcal_Process_Sig$ProteinNumber<-999
+GO_Bioloigcal_Process_Sig$ProteinNumberControl<-999
+GO_Bioloigcal_Process_Sig$TotalControlProtein<-nrow(enrichment_control_data)
+GO_Bioloigcal_Process_Sig$TotalSignificant<-sum(chicks_adults_df$p_adjust < 0.05 &
+                                                  !is.na(chicks_adults_df$p_adjust))
+
+for(i in 1:nrow(GO_Bioloigcal_Process_Sig)) {
+
+  GO_Bioloigcal_Process_Sig$ProteinNumber[i]<-as.numeric(sub("\\/.*", "", GO_Bioloigcal_Process_Sig$Overlap[i]))
+  
+  if(GO_Bioloigcal_Process_Sig$Term[i] %in% GO_Bioloigcal_Process_Control$Term){
+  Control_data<-GO_Bioloigcal_Process_Control[GO_Bioloigcal_Process_Control$Term==GO_Bioloigcal_Process_Sig$Term[i],]
+  
+  GO_Bioloigcal_Process_Sig$ProteinNumberControl[i]<-as.numeric(sub("\\/.*", "", Control_data$Overlap))
+  
+  } else {
+    GO_Bioloigcal_Process_Sig$ProteinNumberControl[i]<-0
+  }
+}
+
+GO_Bioloigcal_Process_Sig<- GO_Bioloigcal_Process_Sig[GO_Bioloigcal_Process_Sig$ProteinNumber>2,]
+
+for(i in 1:nrow(GO_Bioloigcal_Process_Sig)){
+
+  control<-c(rep(1,GO_Bioloigcal_Process_Sig$ProteinNumberControl[i]), rep(0,GO_Bioloigcal_Process_Sig$TotalControlProtein[i] - 
+                                                                             GO_Bioloigcal_Process_Sig$ProteinNumberControl[i]))
+
+  repeats<-10000
+
+  n<-rep(9999, repeats)
+  sum(control)
+
+for (j in 1:repeats){
+  
+  n[j]<-sum(sample(control, GO_Bioloigcal_Process_Sig$TotalSignificant[i]))
+  
+}
+
+  significant<-GO_Bioloigcal_Process_Sig$ProteinNumber[i]
+
+  GO_Bioloigcal_Process_Sig$PermutationTest[i]<- sum(n>=(significant))/repeats
+
+  dat <- data.frame(
+    "Control" = c(GO_Bioloigcal_Process_Sig$ProteinNumberControl[i], (GO_Bioloigcal_Process_Sig$TotalControlProtein[i] -
+                                                                      GO_Bioloigcal_Process_Sig$ProteinNumberControl[i])),
+    "Significant" = c(significant, (GO_Bioloigcal_Process_Sig$TotalSignificant[i]-significant)),
+    row.names = c("Pathway", "Non-pathway"), stringsAsFactors = FALSE
+)
+  colnames(dat) <- c("Control", "Significant")
+
+  dat
+}
+
+#View(GO_Bioloigcal_Process_Sig)
+
+adult_GO_Bioloigcal_Process_Sig <- GO_Bioloigcal_Process_Sig[GO_Bioloigcal_Process_Sig$PermutationTest < 0.05, ]
+datatable(adult_GO_Bioloigcal_Process_Sig)
+```
+
+4. KEGG_2021_Human
+```{r GO_KEGG enrichment}
+KEGG_Sig<-enrichment_Sig$KEGG_2021_Human[,c("Term","Overlap","Genes")]
+KEGG_Control<-enrichment_control$KEGG_2021_Human[,c("Term","Overlap","Genes")]
+
+KEGG_Sig$PermutationTest<-999
+KEGG_Sig$ProteinNumber<-999
+KEGG_Sig$ProteinNumberControl<-999
+KEGG_Sig$TotalControlProtein<-nrow(enrichment_control_data)
+KEGG_Sig$TotalSignificant<-sum(chicks_adults_df$p_adjust < 0.05 & !is.na(chicks_adults_df$p_adjust))
+
+for(i in 1:nrow(KEGG_Sig)) {
+
+  KEGG_Sig$ProteinNumber[i]<-as.numeric(sub("\\/.*", "", KEGG_Sig$Overlap[i]))
+  
+  if(KEGG_Sig$Term[i] %in% KEGG_Control$Term){
+  Control_data<-KEGG_Control[KEGG_Control$Term==KEGG_Sig$Term[i],]
+  
+  KEGG_Sig$ProteinNumberControl[i]<-as.numeric(sub("\\/.*", "", Control_data$Overlap))
+  
+  } else {
+    KEGG_Sig$ProteinNumberControl[i]<-0
+  }
+}
+
+KEGG_Sig<- KEGG_Sig[KEGG_Sig$ProteinNumber>2,]
+
+for(i in 1:nrow(KEGG_Sig)){
+
+  control<-c(rep(1,KEGG_Sig$ProteinNumberControl[i]), rep(0,KEGG_Sig$TotalControlProtein[i] - KEGG_Sig$ProteinNumberControl[i]))
+
+  repeats<-10000
+
+  n<-rep(9999, repeats)
+  sum(control)
+
+for (j in 1:repeats){
+  
+  n[j]<-sum(sample(control, KEGG_Sig$TotalSignificant[i]))
+}
+
+  significant<-KEGG_Sig$ProteinNumber[i]
+
+  KEGG_Sig$PermutationTest[i]<- sum(n>=(significant))/repeats
+
+  dat <- data.frame(
+    "Control" = c(KEGG_Sig$ProteinNumberControl[i], (KEGG_Sig$TotalControlProtein[i] - KEGG_Sig$ProteinNumberControl[i])),
+    "Significant" = c(significant, (KEGG_Sig$TotalSignificant[i]-significant)),
+    row.names = c("Pathway", "Non-pathway"), stringsAsFactors = FALSE
+)
+  colnames(dat) <- c("Control", "Significant")
+
+  dat
+}
+
+#View(KEGG_Sig)
+
+adult_KEGG_Sig <- KEGG_Sig[KEGG_Sig$PermutationTest < 0.05, ]
+datatable(adult_KEGG_Sig)
+```
+
+5. WikiPathway_2021_Human database 
+```{r WikiPathway enrichment}
+WikiPathway_Sig<-enrichment_Sig$WikiPathway_2021_Human[,c("Term","Overlap","Genes")]
+WikiPathway_Control<-enrichment_control$WikiPathway_2021_Human[,c("Term","Overlap","Genes")]
+
+WikiPathway_Sig$PermutationTest<-999
+WikiPathway_Sig$ProteinNumber<-999
+WikiPathway_Sig$ProteinNumberControl<-999
+WikiPathway_Sig$TotalControlProtein<-nrow(enrichment_control_data)
+WikiPathway_Sig$TotalSignificant<-sum(chicks_adults_df$p_adjust < 0.05 & !is.na(chicks_adults_df$p_adjust))
+
+for(i in 1:nrow(WikiPathway_Sig)) {
+
+  WikiPathway_Sig$ProteinNumber[i]<-as.numeric(sub("\\/.*", "", WikiPathway_Sig$Overlap[i]))
+  
+  if(WikiPathway_Sig$Term[i] %in% WikiPathway_Control$Term){
+  Control_data<-WikiPathway_Control[WikiPathway_Control$Term==WikiPathway_Sig$Term[i],]
+  
+  WikiPathway_Sig$ProteinNumberControl[i]<-as.numeric(sub("\\/.*", "", Control_data$Overlap))
+  
+  } else {
+    WikiPathway_Sig$ProteinNumberControl[i]<-0
+  }
+}
+
+WikiPathway_Sig<- WikiPathway_Sig[WikiPathway_Sig$ProteinNumber>2,]
+
+for(i in 1:nrow(WikiPathway_Sig)){
+
+  control<-c(rep(1,WikiPathway_Sig$ProteinNumberControl[i]), rep(0,WikiPathway_Sig$TotalControlProtein[i] - 
+                                                                   WikiPathway_Sig$ProteinNumberControl[i]))
+
+  repeats<-10000
+
+  n<-rep(9999, repeats)
+  sum(control)
+
+for (j in 1:repeats){
+  
+  n[j]<-sum(sample(control, WikiPathway_Sig$TotalSignificant[i]))
+}
+
+  significant<-WikiPathway_Sig$ProteinNumber[i]
+
+  WikiPathway_Sig$PermutationTest[i]<- sum(n>=(significant))/repeats
+
+  dat <- data.frame(
+    "Control" = c(WikiPathway_Sig$ProteinNumberControl[i], (WikiPathway_Sig$TotalControlProtein[i] - 
+                                                            WikiPathway_Sig$ProteinNumberControl[i])),
+    "Significant" = c(significant, (WikiPathway_Sig$TotalSignificant[i]-significant)),
+    row.names = c("Pathway", "Non-pathway"), stringsAsFactors = FALSE
+)
+  colnames(dat) <- c("Control", "Significant")
+
+  dat
+}
+
+#View(WikiPathway_Sig)
+
+adults_WikiPathway_Sig <- WikiPathway_Sig[WikiPathway_Sig$PermutationTest <0.05, ]
+datatable(adults_WikiPathway_Sig)
+```
+
+# Figure 2. Coagulation heatmap
+```{r coagulation heatmap}
+# Define gene set related to coagulation pathways
+coagulation <- c("C7", "C8B", "CD55", "F10", "F11", "F2", "FGA", "FGB", "FGG", "VWF") 
+
+# Subset to rows where gene_symbol is in 'coagulation', and select:
+# - protein abundance data (columns 5:47)
+# - gene_symbol (column 55)
+# - adjusted p-value (column 49)
+pre_heatmap_df <- chicks_adults_df[chicks_adults_df$gene_symbol %in% coagulation, c(5:47, 54, 49)]
+
+# For each gene, keep only the row with the lowest p_adjust (most significant entry)
+pre_heatmap_df <- pre_heatmap_df %>%
+  group_by(gene_symbol) %>%
+  slice_min(order_by = p_adjust, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+# Apply a square root transformation to the protein abundance values
+pre_heatmap_df[, 1:length(age)] <- sqrt(pre_heatmap_df[, 1:length(age)])
+
+# Generate a heatmap:
+# - data: transformed abundance values
+# - row labels: gene symbols
+# - column labels: ordered by age (F for chicks, A for adults)
+# - no clustering of rows or columns
+# - rows scaled (Z-score)
+# - RdBu color palette reversed for better visual contrast
+pheatmap(pre_heatmap_df[, 1:length(age)],
+         labels_row = pre_heatmap_df$gene_symbol,
+         scale = "row",
+         labels_col = age[c(which(age == "F"), which(age == "A"))],
+         fontsize_row = 12,
+         cluster_cols = FALSE,
+         cluster_rows = FALSE,
+         legend = TRUE,
+         breaks = seq(-2, 2, length.out = 11),
+         cellwidth = 20,      # width of each sample column
+         cellheight = 20,     # height of each gene row
+         color = rev(brewer.pal(11, "RdBu")))
+```
+
+Function to graph individual proteins of interest for data exploration
+# Figure 3. Raincloud plot 
+```{r graph protein function}
+graph_protein <- function(gene_symbol) {
+  # Subset the data columns for the specified gene
+  protein_Count <- chicks_adults_df[chicks_adults_df$gene_symbol  == gene_symbol , 5:47]
+  
+  # Sum protein counts across samples, keeping NAs
+  protein_Count <- colSums(protein_Count, na.rm = FALSE)
+  
+  # Create a new dataframe for plotting
+  graph_data <- data.frame(age, as.numeric(protein_Count))
+  colnames(graph_data) <- c("Age", "Protein_count")
+  
+  # Count missing values for annotation (A = adults, F = fledglings)
+  missing <- c(
+    sum(is.na(graph_data$Protein_count[graph_data$Age == "A"])),
+    sum(is.na(graph_data$Protein_count[graph_data$Age == "F"]))
+  )
+  
+  # Define colorblind-friendly green (young) and blue (adult)
+  colours <- c("F" = "#22a884", "A" = "#355f8d")
+  
+  # Generate the raincloud plot
+  rain_cloud_plot <- ggplot(graph_data, aes(Age, Protein_count, fill = Age, col = Age)) + 
+    geom_flat_violin(position = position_nudge(x = 0.1, y = 0), alpha = 1, width = 0.5) +
+    geom_point(position = position_jitterdodge(dodge.width = 0.15, jitter.width = 0.15), size = 2, alpha = 1) +
+    geom_boxplot(color = "black", width = 0.1, outlier.shape = NA, alpha = 1, 
+                 position = position_nudge(x = -0.2, y = 0)) +
+    coord_flip() +
+    labs(x = "", y = "Relative levels", 
+         title = paste("", gene_symbol)) +  # Add protein name to title
+    scale_y_continuous(trans = "sqrt") +
+    theme_classic() +
+    theme(legend.position = "none", text = element_text(size = 14)) +
+    scale_fill_manual(values = colours) +
+    scale_colour_manual(values = colours) +
+    scale_x_discrete(labels = c("A" = "Adult", "F" = "Fledgling")) +
+    annotate("text", label = missing, x = levels(as.factor(graph_data$Age)), 
+             y = rep(min(graph_data$Protein_count, na.rm = TRUE)/4, 2)) +
+    annotate("text", label = "Not detected", x = 0.5, 
+             y = min(graph_data$Protein_count, na.rm = TRUE)/3) +
+    geom_hline(yintercept = min(graph_data$Protein_count, na.rm = TRUE)*3/4,
+               linetype = 'dashed', col = "#666666", linewidth = 1)
+  
+  print(rain_cloud_plot)
+}
+```
+
+```{r graphing proteins of interest, warning=FALSE, message=FALSE, echo=FALSE}
+# Insert protein symbol of choice
+graph_protein("")
+```
+
+# Figure 4. Metabolism heatmap
+```{r metabolism heatmap}
+# Define a vector of gene symbols related to metabolic pathways
+metabolism <- c("ENO1", "PGM1", "TPI1", "APOD", "FABP4", "ALDOB", "MINPP1", "PKM", "ME1") 
+
+# Subset the dataframe to only rows with genes in 'metabolism' and select relevant columns:
+# protein abundance data (cols 5:47), gene symbol (col 55), and p_adjust (col 49)
+pre_heatmap_df <- chicks_adults_df[chicks_adults_df$gene_symbol %in% metabolism, c(5:47, 54, 49)]
+
+# For genes with multiple entries, keep only the row with the lowest p_adjust (most significant)
+pre_heatmap_df <- pre_heatmap_df %>%
+  group_by(gene_symbol) %>%
+  slice_min(order_by = p_adjust, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+# Convert gene_symbol to a factor to retain the desired order specified in 'metabolism'
+pre_heatmap_df$gene_symbol <- factor(pre_heatmap_df$gene_symbol, levels = metabolism)
+
+# Reorder the dataframe rows based on the factor levels of gene_symbol
+pre_heatmap_df <- pre_heatmap_df[order(pre_heatmap_df$gene_symbol), ]
+
+# Apply a square root transformation to the abundance data (columns 1 to length of 'age')
+pre_heatmap_df[, 1:length(age)] <- sqrt(pre_heatmap_df[, 1:length(age)])
+
+# Generate a heatmap:
+# - input: transformed abundance data
+# - labels for rows: gene symbols (ordered)
+# - labels for columns: sample age (F for chicks, A for adults)
+# - scaling applied by row
+# - no clustering
+# - customized cell size, breaks, and color scale
+pheatmap(pre_heatmap_df[, 1:length(age)],
+         labels_row = pre_heatmap_df$gene_symbol,
+         scale = "row",
+         labels_col = age[c(which(age == "F"), which(age == "A"))],
+         fontsize_row = 12,
+         cluster_cols = FALSE,
+         cluster_rows = FALSE,
+         legend = TRUE,
+         cellwidth = 20,
+         cellheight = 20,
+         breaks = seq(-2, 2, length.out = 11),
+         color = rev(brewer.pal(11, "RdBu")))
+```
+
+Backwards enrichment analysis
+```{r backwards enrichment analysis}
+#install.packages("BiocManager")
+#BiocManager::install("org.Hs.eg.db")
+
+library("org.Hs.eg.db")
+go_term <- "GO:0062023" # Insert pathway of interest
+columns(org.Hs.eg.db)
+genes <- select(org.Hs.eg.db, 
+                keys = go_term,
+                keytype = "GO",
+                columns = c("SYMBOL", "GENENAME", "ONTOLOGY")
+                )
+col_ecm <- genes
+```
+
+# Figure S1. Collagen-Containing Extracellular Matrix (GO:0062023) heatmap 
+```{r collagen heatmap}
+# Extract gene symbols from a dataframe of extracellular matrix-related genes
+colecm <- col_ecm$SYMBOL
+
+# Subset chicks_adults_df to ECM-related genes, selecting abundance data (cols 5:47) and adjusted p-values (col 49)
+pre_heatmap_df <- chicks_adults_df[chicks_adults_df$gene_symbol %in% colecm, c(5:47, 49)]
+
+# Apply square root transformation to the protein abundance values
+pre_heatmap_df[, 1:length(age)] <- sqrt(pre_heatmap_df[, 1:length(age)])
+
+# Remove rows with any missing values (complete cases only)
+pre_heatmap_df_trim <- pre_heatmap_df[complete.cases(pre_heatmap_df), ]
+
+# Generate heatmap of ECM-related genes (trimmed and clustered by rows)
+pheatmap(pre_heatmap_df_trim[, 1:length(age)],             # Input matrix: transformed abundance values
+         labels_row = pre_heatmap_df_trim$gene_symbol,     # Label rows by gene symbol
+         scale = "row",                                    # Scale values per row (Z-score transformation)
+         labels_col = age[c(which(age == "F"), which(age == "A"))],  # Label columns by age group: chicks ("F") and adults ("A")
+         fontsize_row = 12,                                # Row label font size
+         cluster_cols = FALSE,                             # Do not cluster columns (samples)
+         cluster_rows = TRUE,                              # Cluster rows (genes)
+         legend = TRUE,                                    # Show color legend
+         breaks = seq(-2, 2, length.out = 11),             # Define color breakpoints
+         color = rev(brewer.pal(11, "RdBu")))              # Use reversed Red-Blue color palette: blue = lower, red = higher expression
+```
+
+# Figure S2. Adults maturation
+```{r adult maturation}
+# Subset the sample info to adult individuals only (rows 20 to 43)
+adults_sampleinfo <- chicks_adults_sampleinfo[20:43, ]
+
+
+# Subset the protein expression data: include p_adjust (col 49) and protein abundances (cols 24 to 47)
+ffsh_adults <- chicks_adults_df[, c(49, 24:47)]
+
+# Extract the Maturity classifications as a vector
+maturity <- adults_sampleinfo$Adult_Age
+
+# Assign colors: default is dark blue for all, then light blue for Immature
+col <- rep("#0072b2", length(maturity))           # Default color for all
+col[maturity == "Immature"] <- "#56b4e9"          # Change color for Immature group
+
+# Create PCA input matrix:
+# - Select only columns 2:25 (protein abundance)
+# - Use only rows with no missing values (complete cases)
+# - Transpose so proteins are rows, samples are columns
+PCA_matrix <- t(as.matrix(ffsh_adults[complete.cases(ffsh_adults), 2:25]))
+
+# Perform Principal Component Analysis with scaling
+PCA <- prcomp(PCA_matrix, scale = TRUE)
+
+# Summarize PCA importance (variance explained per component), rounded to 3 decimal places
+summary_PCA <- round(data.frame(summary(PCA)$importance), 3)
+
+# Check the percentage of variance explained by PC1 and PC2
+summary_PCA$PC1[2]  # PC1 variance
+summary_PCA$PC2[2]  # PC2 variance
+
+# Optional: Uncomment to save as PDF
+# pdf("PCA Proteomics Biomarker FFSH Adults vs Plastic load.pdf", height = 7, width = 8)
+
+# Set up plot margins and figure layout
+par(fig = c(0, 1, 0, 1), oma = c(5, 2, 2, 2), mar = c(6, 4, 2, 2))
+
+# Create scatterplot of PCA scores (first two principal components)
+plot(PCA$x[, 1:2],
+     col = col,
+     pch = 16,
+     cex = 1.5,
+     xlab = "",
+     ylab = "")
+
+# Add title and axis labels with % variance explained
+title(main = "PCA FFSH adults maturity",
+      xlab = paste0("PCA1 ", (100 * summary_PCA$PC1[2]), "%"),
+      ylab = paste0("PCA2 ", (100 * summary_PCA$PC2[2]), "%"))
+
+# Add a legend indicating maturity groups
+legend("topleft",
+       bty = "n",  # no box
+       legend = c("Immature", "Mature"),
+       pch = 16,
+       col = c("#56b4e9", "#0072b2"),  # match to assigned colors
+       cex = 1,
+       horiz = FALSE,
+       title = "Age")
+
+```
